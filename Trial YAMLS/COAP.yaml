@@ -1,0 +1,20 @@
+protocol: CoAP
+transport: udp
+port: 5683
+
+types:
+  CoAPHeader:
+    size: 4
+    fields:
+      version_type_tkl: { offset: 0, type: u8 }
+      code:             { offset: 1, type: u8 }
+      message_id:       { offset: 2, type: u16 }
+
+layout:
+  header: CoAPHeader
+
+observability:
+  filters:
+    - field: header.code
+      op: EQUAL
+      value: 1 # GET request

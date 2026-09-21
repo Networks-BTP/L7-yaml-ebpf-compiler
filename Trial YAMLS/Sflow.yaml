@@ -1,0 +1,33 @@
+protocol: sFlowV5
+transport: udp
+port: 6343
+
+types:
+  SampleHeader:
+    size: 16
+    fields:
+      sample_type:   { offset: 0, type: u32 }
+      sample_length: { offset: 4, type: u32 }
+      seq_number:    { offset: 8, type: u32 }
+
+  sFlowHeader:
+    size: 16
+    fields:
+      version:     { offset: 0,  type: u32 }
+      agent_ip:    { offset: 4,  type: ipv4 }
+      seq_number:  { offset: 8,  type: u32 }
+      num_samples: { offset: 12, type: u32 }
+
+layout:
+  header: sFlowHeader
+  payload:
+    type: array
+    element_type: SampleHeader
+    length_field: header.num_samples
+    max_elements: 10
+
+observability:
+  filters:
+    - field: header.agent_ip
+      op: EQUAL
+      value: "192.168.1.1"

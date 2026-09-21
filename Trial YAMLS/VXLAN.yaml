@@ -1,0 +1,40 @@
+protocol: VXLAN
+transport: udp
+port: 4789
+
+types:
+  VxlanHeader:
+    size: 8
+    fields:
+      flags: { offset: 0, type: u8 }
+      vni:   { offset: 4, type: u24 }
+
+  InnerEthernetHeader:
+    size: 14
+    fields:
+      ether_type: { offset: 12, type: u16 }
+      # Bounds check of the fields for all fields for all structs
+      # 12 + sizeof(u16) <= 14
+
+  InnerIPHeader:
+    size: 20
+    fields:
+      protocol: { offset: 9,  type: u8 }
+      src_ip:   { offset: 12, type: ipv4 }
+      dst_ip:   { offset: 16, type: ipv4 }
+
+# Sequential layout definition
+layout:
+  vxlan:     { offset: 0,  type: VxlanHeader }
+  inner_eth: { offset: 8,  type: InnerEthernetHeader }
+  inner_ip:  { offset: 22, type: InnerIPHeader } # 8 + 14 = 22
+
+observability:
+  filters:
+    - field: inner_ip.dst_ip
+      op: EQUAL
+      value: "10.0.0.1"
+    
+# What do you mean by type:ipv4 
+# We have to add L2-L4 protocol filtering (IP/UDP/Port number etc) on the 
+# filtering part as well maybe or separately for visibility

@@ -1,0 +1,33 @@
+protocol: ModbusTCP
+transport: tcp
+port: 502
+
+types:
+  MBAPHeader:
+    size: 7
+    fields:
+      transaction_id: { offset: 0, type: u16 }
+      protocol_id:    { offset: 2, type: u16 }
+      length:         { offset: 4, type: u16 }
+      unit_id:        { offset: 6, type: u8 }
+
+  ReadHoldingRegistersResp:
+    fields:
+      function_code: { offset: 0, type: u8 }
+      byte_count:    { offset: 1, type: u8 }
+      registers:     { offset: 2, type: u16_array, element_size: 2, max_elements: 125 }
+
+layout:
+  header: MBAPHeader
+  payload:
+    discriminator: header.function_code
+    cases:
+      0x03: ReadHoldingRegistersResp
+
+observability:
+  filters:
+    - field: header.unit_id
+      op: EQUAL
+      value: 1
+  metrics:
+    - field: payload.function_code
