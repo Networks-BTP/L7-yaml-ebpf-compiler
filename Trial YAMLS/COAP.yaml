@@ -18,3 +18,6 @@ observability:
     - field: header.code
       op: EQUAL
       value: 1 # GET request
+
+
+# this yaml just contains the header which is fixed, followed by token, options, payload
