@@ -31,3 +31,7 @@ observability:
       value: 1
   metrics:
     - field: payload.function_code
+
+#The layout definition attempts to use header.function_code as a discriminator, 
+#but function_code is actually the first field of the payload (defined inside ReadHoldingRegistersResp), 
+#not part of the MBAPHeader.
