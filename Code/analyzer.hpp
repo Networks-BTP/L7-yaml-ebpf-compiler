@@ -1,11 +1,15 @@
 #pragma once
 
 #include "ast.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <variant>
 #include <vector>
-#include <iostream>
 
 namespace DSLAnalyzer {
 
@@ -50,8 +54,9 @@ struct ResolvedFilter {
 struct ResolvedContext {
     std::string protocol_name;
     std::string transport;
-    uint16_t port;
+    uint16_t port{0};
     std::unordered_map<std::string, ResolvedType> types;
+    std::vector<std::string> type_order; // Declaration order, so generated C is deterministic
     std::vector<ResolvedLayoutInstance> layout;
     std::vector<ResolvedFilter> filters;
 };
@@ -124,6 +129,10 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
             r_type.ordered_fields.push_back(r_field);
         }
 
+        if (ctx.types.count(r_type.name)) {
+            throw std::runtime_error("Semantic Error: Duplicate type name '" + r_type.name + "'");
+        }
+        ctx.type_order.push_back(r_type.name);
         ctx.types[r_type.name] = r_type;
     }
 

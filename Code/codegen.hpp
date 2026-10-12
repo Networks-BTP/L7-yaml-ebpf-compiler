@@ -3,41 +3,74 @@
 #include "analyzer.hpp"
 #include <nlohmann/json.hpp>
 #include <inja/inja.hpp>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 
 namespace DSLCodeGen {
 
 using json = nlohmann::json;
 
-// Helper to map our AST DataType to standard C/eBPF types
-inline std::string map_c_type(DSLAnalyzer::DataType type, uint32_t size_bytes) {
-    if (type == DSLAnalyzer::DataType::INT) {
-        if (size_bytes == 1) return "uint8_t";
-        if (size_bytes == 2) return "uint16_t";
-        if (size_bytes == 4) return "uint32_t";
-        if (size_bytes == 8) return "uint64_t";
+// True when a field maps to a plain C scalar (as opposed to a byte array).
+inline bool is_scalar_field(DataType type, uint32_t size_bytes) {
+    if (type == DataType::INT)
+        return size_bytes == 1 || size_bytes == 2 || size_bytes == 4 || size_bytes == 8;
+    if (type == DataType::BOOLEAN) return true;
+    return false;
+}
+
+// Helper to map our AST DataType to standard C/eBPF types.
+// Only meaningful for scalar fields; everything else is a uint8_t array.
+inline std::string map_c_type(DataType type, uint32_t size_bytes) {
+    if (type == DataType::INT) {
+        if (size_bytes == 1) return "__u8";
+        if (size_bytes == 2) return "__u16";
+        if (size_bytes == 4) return "__u32";
+        if (size_bytes == 8) return "__u64";
     }
-    // For BYTES, STRING, or unknown sizes, fallback to a byte array
-    return "uint8_t";
+    if (type == DataType::BOOLEAN) return "__u8";
+    // BYTES, STRING, odd-sized ints, floats: raw byte array
+    return "__u8";
+}
+
+inline std::string filter_op_to_c(FilterOp op) {
+    switch (op) {
+        case FilterOp::EQUAL:        return "==";
+        case FilterOp::NOT_EQUAL:    return "!=";
+        case FilterOp::GREATER_THAN: return ">";
+        case FilterOp::LESS_THAN:    return "<";
+    }
+    return "==";
+}
+
+// Network-to-host conversion wrapper for a given scalar size (protocol fields are big-endian).
+inline std::string ntoh_wrapper(uint32_t size_bytes) {
+    if (size_bytes == 2) return "bpf_ntohs";
+    if (size_bytes == 4) return "bpf_ntohl";
+    if (size_bytes == 8) return "bpf_be64_to_cpu";
+    return ""; // 1 byte: no swap needed
 }
 
 // 1. Context to JSON Mapper
 inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
     json data;
+    std::string upper = ctx.protocol_name;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
     data["protocol"] = ctx.protocol_name;
-    data["protocol_upper"] = ctx.protocol_name;
-    std::transform(data["protocol_upper"].get_ref<std::string&>().begin(), 
-                   data["protocol_upper"].get_ref<std::string&>().end(), 
-                   data["protocol_upper"].get_ref<std::string&>().begin(), ::toupper);
-                   
+    data["protocol_upper"] = upper;
     data["transport"] = ctx.transport;
     data["port"] = ctx.port;
 
-    // Map Types to C Structs
+    // Map Types to C Structs (declaration order -> deterministic output)
     data["structs"] = json::array();
-    for (const auto& [name, r_type] : ctx.types) {
+    for (const auto& name : ctx.type_order) {
+        const auto& r_type = ctx.types.at(name);
+
         // We only generate static structs for non-dynamic types.
         // Variable-length types must be parsed byte-by-byte in XDP.
         if (r_type.is_dynamic) continue;
@@ -50,16 +83,14 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
             json field_json;
             field_json["name"] = r_field.name;
             field_json["c_type"] = map_c_type(r_field.data_type, r_field.max_size);
-            
-            // If it's a byte array/string, we need array syntax in C
-            if (r_field.data_type == DSLAnalyzer::DataType::BYTES || 
-                r_field.data_type == DSLAnalyzer::DataType::STRING) {
+
+            if (is_scalar_field(r_field.data_type, r_field.max_size)) {
+                field_json["is_array"] = false;
+            } else {
                 field_json["is_array"] = true;
                 field_json["array_size"] = r_field.max_size;
-            } else {
-                field_json["is_array"] = false;
             }
-            
+
             struct_json["fields"].push_back(field_json);
         }
         data["structs"].push_back(struct_json);
@@ -73,6 +104,42 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
         l_json["type_ref"] = l_inst.type_ref;
         l_json["is_dynamic"] = ctx.types.at(l_inst.type_ref).is_dynamic;
         data["layout"].push_back(l_json);
+    }
+
+    // Map Filters: only scalar integer fields of static types can be compared in C.
+    data["filters"] = json::array();
+    for (const auto& f : ctx.filters) {
+        const auto& inst = *std::find_if(ctx.layout.begin(), ctx.layout.end(),
+            [&](const DSLAnalyzer::ResolvedLayoutInstance& i) { return i.instance_name == f.layout_instance; });
+        const auto& r_type = ctx.types.at(inst.type_ref);
+        if (r_type.is_dynamic) continue;
+
+        const auto& r_field = r_type.field_map.at(f.field_name);
+        if (r_field.data_type != DataType::INT || !is_scalar_field(r_field.data_type, r_field.max_size)) {
+            std::cerr << "[Codegen] Warning: filter on '" << f.layout_instance << "." << f.field_name
+                      << "' skipped (only scalar integer fields are supported)\n";
+            continue;
+        }
+
+        json fj;
+        fj["instance_name"] = f.layout_instance;
+        fj["field_name"] = f.field_name;
+        fj["op"] = filter_op_to_c(f.op);
+        fj["ntoh"] = ntoh_wrapper(r_field.max_size);
+        // Value is emitted into C source, so require a plain integer literal.
+        size_t consumed = 0;
+        unsigned long long numeric = 0;
+        try {
+            numeric = std::stoull(f.value, &consumed, 0);
+        } catch (...) {
+            consumed = 0;
+        }
+        if (consumed == 0 || consumed != f.value.size()) {
+            throw std::runtime_error("Codegen Error: filter value '" + f.value + "' for '" +
+                                     f.layout_instance + "." + f.field_name + "' is not an integer");
+        }
+        fj["value"] = std::to_string(numeric) + "ULL";
+        data["filters"].push_back(fj);
     }
 
     return data;
@@ -101,6 +168,7 @@ struct {{ struct.name }} {
 const char* TEMPLATE_TRACER_C = R"(
 #include "common.h"
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -152,6 +220,11 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 
 ## endfor
 
+    // 4. Observability Filters
+## for f in filters
+    if (!({{ f.ntoh }}({{ f.instance_name }}->{{ f.field_name }}) {{ f.op }} {{ f.value }})) return XDP_PASS;
+## endfor
+
     // Payload successfully parsed and matched!
     // (Telemetry emission / Ringbuf logic would go here)
     
@@ -172,10 +245,12 @@ inline void generate(const DSLAnalyzer::ResolvedContext& ctx, const std::string&
     std::string tracer_c = env.render(TEMPLATE_TRACER_C, data);
 
     std::ofstream out_h(out_dir + "/common.h");
+    if (!out_h) throw std::runtime_error("Codegen Error: cannot write " + out_dir + "/common.h");
     out_h << common_h;
     out_h.close();
 
     std::ofstream out_c(out_dir + "/tracer.bpf.c");
+    if (!out_c) throw std::runtime_error("Codegen Error: cannot write " + out_dir + "/tracer.bpf.c");
     out_c << tracer_c;
     out_c.close();
 

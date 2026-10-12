@@ -1,0 +1,38 @@
+1. One-time setup
+
+sudo apt update
+sudo apt install -y build-essential cmake git clang libbpf-dev
+
+2. Copy the project to your Linux home (faster than /mnt/c)
+
+cp -r /mnt/c/Users/HP/btp/L7-yaml-ebpf-compiler/cODE ~/dslc
+cd ~/dslc
+
+If you’ve edited files on the Windows side since, copy them over again (or just re-run the cp -r).
+
+3. Build the compiler
+
+rm -rf build
+cmake -S . -B build
+cmake --build build -j4
+
+The first configure downloads yaml-cpp, nlohmann_json and inja, so it takes a bit. After the first build, you only need cmake --build build -j4 when you change code.
+
+4. Run it on your YAML
+
+./build/dslc trialproto.yaml out
+
+This writes out/common.h and out/tracer.bpf.c.
+
+5. Check the generated C compiles for eBPF
+
+cd out
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu -c tracer.bpf.c -o tracer.bpf.o
+llvm-objdump -h tracer.bpf.o
+cd ..
+
+If it succeeds, tracer.bpf.o exists and the section list shows xdp and license.
+
+6. Copy results back to Windows (optional)
+
+cp -r out /mnt/c/Users/HP/btp/L7-yaml-ebpf-compiler/cODE/out
