@@ -1,0 +1,30 @@
+protocol: toyproto
+transport: udp
+port: 9999
+
+types:
+  Header:
+    fields:
+      magic:      { type: fixed, size: 2 }
+      version:    { type: fixed, size: 1 }
+      opcode:     { type: fixed, size: 1 }
+      length:     { type: fixed, size: 2 }
+      request_id: { type: fixed, size: 4 }
+  Body:
+    fields:
+      key:   { type: fixed, size: 8, data_type: bytes }
+      flags: { type: fixed, size: 2 }
+
+layout:
+  - name: hdr
+    type: Header
+  - name: body
+    type: Body
+
+filters:
+  - field: hdr.opcode
+    op: "=="
+    value: "1"
+  - field: hdr.version
+    op: ">"
+    value: "0"
