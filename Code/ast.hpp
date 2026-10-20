@@ -39,8 +39,18 @@ struct FixedFieldNode : public FieldBase {
     // std::optional<uint8_t> bit_size;
 };
 
-// 2. Updated Length-Prefixed Node
-struct LengthPrefixedFieldNode : public FieldBase {};
+// 2. Length-Prefixed Node
+// The size of the field's bytes is computed at runtime as:
+//     size = <length_field value> * multiplier + addend
+// and must not exceed max_bytes (the hard cap the eBPF verifier needs).
+// These can be given inline on the field, or later via the separate
+// `lp_resolutions` section (see LengthPrefixedResolution).
+struct LengthPrefixedFieldNode : public FieldBase {
+    std::optional<std::string> length_field; // name of an earlier field in the same type
+    std::optional<uint32_t> max_bytes;
+    uint32_t multiplier{1};
+    int32_t addend{0};
+};
 
 // 3. Delimiter Node
 struct DelimiterFieldNode : public FieldBase {
@@ -82,8 +92,11 @@ struct LayoutNode {
 };
 
 struct LengthPrefixedResolution{
+    std::optional<std::string> type_name;        // optional: which type the field lives in (needed if the field name is ambiguous)
+    std::optional<std::string> instance_name;    // optional: which layout instance this applies to (cross-struct lengths are bound per instance)
     std::string field_name;
-    std::string length_name;
+    std::string length_name;                     // "len"  = field of the same type declared earlier
+                                                 // "hdr.len" = field of an earlier layout instance (cross-struct)
     uint32_t multiplier{1};                      // e.g., IHL * 4
     int32_t addend{0};                           // e.g., Length - 2
     uint32_t max_bytes;                          // Hard cap for eBPF verifier

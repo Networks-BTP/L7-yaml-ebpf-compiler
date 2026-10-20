@@ -1,0 +1,45 @@
+# Cross-struct lengths: the length of a payload lives in a *different* struct (Header),
+# so it cannot be named inside the type. It is bound per layout instance instead.
+#
+#   Header (4 bytes):  magic(2) len_a(1) len_b(1)
+#   Chunk  (dynamic):  data(length from elsewhere) tail(1)
+#
+# The same type `Chunk` is used three times, each time with a different length source:
+#   a: data size = hdr.len_a                (static source, 1:1, cap 16)
+#   b: data size = hdr.len_b * 2            (static source, multiplier, cap 32)
+#   c: data size = a.tail                   (dynamic source: a field of an earlier Chunk)
+
+protocol: crossproto
+transport: tcp
+port: 7001
+
+types:
+  Header:
+    fields:
+      magic: { type: fixed, size: 2 }
+      len_a: { type: fixed, size: 1 }
+      len_b: { type: fixed, size: 1 }
+  Chunk:
+    fields:
+      data: { type: length_prefixed }
+      tail: { type: fixed, size: 1 }
+
+layout:
+  - name: hdr
+    type: Header
+  - name: a
+    type: Chunk
+  - name: b
+    type: Chunk
+  - name: c
+    type: Chunk
+
+lp_resolutions:
+  - { instance: a, field_name: data, length_name: hdr.len_a, max_bytes: 16 }
+  - { instance: b, field_name: data, length_name: hdr.len_b, multiplier: 2, max_bytes: 32 }
+  - { instance: c, field_name: data, length_name: a.tail,    max_bytes: 8 }
+
+filters:
+  - field: hdr.magic
+    op: "=="
+    value: "0xCAFE"

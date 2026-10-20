@@ -103,6 +103,10 @@ inline FieldNode parse_field(const std::string& field_name, const YAML::Node& no
         field.name = field_name;
         field.offset_expr = offset_expr;
         field.data_type = parse_data_type(raw_data_type, DataType::BYTES);
+        field.length_field = get_optional_field<std::string>(node, "length_field");
+        field.max_bytes = get_optional_field<uint32_t>(node, "max_bytes");
+        field.multiplier = get_optional_field<uint32_t>(node, "multiplier").value_or(1);
+        field.addend = get_optional_field<int32_t>(node, "addend").value_or(0);
         return field;
     } 
     else if (prim_type == "delimiter") {
@@ -239,6 +243,8 @@ inline ProtocolAST parse_yaml(const std::string& yaml_content) {
             YAML::Node item = lp_node[i];
 
             LengthPrefixedResolution res;
+            res.type_name = get_optional_field<std::string>(item, "type");
+            res.instance_name = get_optional_field<std::string>(item, "instance");
             res.field_name = get_required_field<std::string>(item, "field_name", context);
             res.length_name = get_required_field<std::string>(item, "length_name", context);
             res.max_bytes = get_required_field<uint32_t>(item, "max_bytes", context + " for '" + res.field_name + "'");

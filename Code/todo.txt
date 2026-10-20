@@ -1,0 +1,4 @@
+Every calculated length is within its configured maximum.
+Every pointer advance stays within data_end.
+Length arithmetic cannot overflow.
+The BPF verifier can establish that every memory access is safe.

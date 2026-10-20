@@ -1,0 +1,38 @@
+# Mixed protocol: a static header followed by a message with a length-prefixed payload.
+#
+#   Header  (4 bytes, static):   magic(2) version(1) msg_type(1)
+#   Message (dynamic):           length(2) flags(2) payload(length - 2 bytes, at most 256) checksum(4)
+#
+# `length` counts everything after itself up to the end of the payload, i.e.
+# flags(2) + payload, so payload size = length * 1 + (-2).
+
+protocol: dynproto
+transport: tcp
+port: 7000
+
+types:
+  Header:
+    fields:
+      magic:    { type: fixed, size: 2 }
+      version:  { type: fixed, size: 1 }
+      msg_type: { type: fixed, size: 1 }
+  Message:
+    fields:
+      length:   { type: fixed, size: 2 }
+      flags:    { type: fixed, size: 2 }
+      payload:  { type: length_prefixed, length_field: length, addend: -2, max_bytes: 256 }
+      checksum: { type: fixed, size: 4 }
+
+layout:
+  - name: hdr
+    type: Header
+  - name: msg
+    type: Message
+
+filters:
+  - field: hdr.msg_type
+    op: "=="
+    value: "1"
+  - field: msg.flags
+    op: ">"
+    value: "0"
