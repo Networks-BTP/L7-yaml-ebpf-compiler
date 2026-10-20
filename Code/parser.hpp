@@ -165,7 +165,7 @@ inline ProtocolAST parse_yaml(const std::string& yaml_content) {
                 throw std::runtime_error("Parsing Error [" + context + "]: Definition must be a YAML map");
             }
 
-            type_node.static_size = get_optional_field<uint32_t>(type_val, "static_size");
+            type_node.static_size = get_optional_field<uint32_t>(type_val, "size");
 
             if (type_val["fields"]) {
                 YAML::Node fields_node = type_val["fields"];
