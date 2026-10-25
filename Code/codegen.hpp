@@ -64,12 +64,29 @@ inline std::string c_struct_name(const DSLAnalyzer::ResolvedType& t) {
 
 inline void require_supported_fields(const DSLAnalyzer::ResolvedType& t) {
     for (const auto& f : t.ordered_fields) {
-        if (f.kind == FieldKind::DELIMITER || f.kind == FieldKind::VARINT) {
-            throw std::runtime_error(std::string("Codegen Error: type '") + t.name + "' uses " +
-                                     (f.kind == FieldKind::DELIMITER ? "delimiter" : "varint") + " field '" + f.name +
-                                     "', which is not supported yet (only fixed and length_prefixed fields are)");
+        if (f.kind == FieldKind::VARINT) {
+            throw std::runtime_error(std::string("Codegen Error: type '") + t.name + "' uses varint field '" + f.name +
+                                     "', which is not supported yet (fixed, length_prefixed and delimiter fields are)");
         }
     }
+}
+
+// Marker bytes as C hex constants, and as printable text for comments.
+inline std::string c_hex(unsigned char b) {
+    static const char* d = "0123456789abcdef";
+    return std::string("0x") + d[b >> 4] + d[b & 15];
+}
+inline std::string printable_marker(const std::string& m) {
+    std::string out;
+    for (unsigned char c : m) {
+        if (c == '\r') out += "\\r";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\t') out += "\\t";
+        else if (c == '\\') out += "\\\\";
+        else if (c >= 0x20 && c < 0x7f) out += static_cast<char>(c);
+        else out += "\\x" + c_hex(c).substr(2);
+    }
+    return "\"" + out + "\"";
 }
 
 // C expression for the value of `field` of an earlier layout instance, in host byte order.
@@ -167,6 +184,76 @@ inline std::string emit_dynamic_parse(const DSLAnalyzer::ResolvedContext& ctx,
             o << "    }\n";
             ++i;
         }
+        else if (f.kind == FieldKind::DELIMITER) {
+            // Scan for the marker in a way the eBPF verifier can digest.  A naive "break when found"
+            // loop makes it explore one path per possible marker position, and that multiplies with
+            // every following delimiter field until the program is rejected as too complex.  So:
+            //  * whether the marker has been seen is tracked arithmetically, not with branches:
+            //      alive = 1 while no marker has matched yet, n = number of bytes before the first match;
+            //  * every iteration builds its own pointer from the offset (DSL_OPAQUE stops the compiler
+            //    from hoisting it into one shared pointer) and guards the read with an `if`, not a
+            //    `break`, so the "past the end of the packet" outcome rejoins the other one right away
+            //    and no packet-range knowledge from one iteration leaks into the next;
+            //  * the offset is masked (0x3FFF) so the pointer's variable offset stays small enough
+            //    that the verifier still accepts bounds checks on it (it gives up above 0xFFFF,
+            //    header offsets included).
+            const std::string name = inst + "." + f.name;
+            const size_t M = f.marker.size();
+            std::string mismatch;
+            for (size_t k = 0; k < M; ++k) {
+                if (k) mismatch += " | ";
+                mismatch += "(p[" + std::to_string(k) + "] ^ " + c_hex(static_cast<unsigned char>(f.marker[k])) + ")";
+            }
+
+            o << "    // " << name << ": delimiter " << printable_marker(f.marker) << ", value at most " << f.max_size
+              << " byte(s)" << (f.trim_whitespace ? ", whitespace trimmed" : "") << "\n";
+            o << "    {\n";
+            o << "        __u32 off0 = ((__u32)((__u8 *)cursor - (__u8 *)app_payload)) & 0x3FFF;\n";
+            o << "        __u32 n = 0, alive = 1;\n";
+            if (f.trim_whitespace) o << "        __u32 lead = 0, last = 0, lead_alive = 1;\n";
+            o << "        #pragma unroll\n";
+            o << "        for (int i = 0; i <= " << f.max_size << "; i++) {\n";
+            o << "            __u32 o = off0 + i;\n";
+            o << "            DSL_OPAQUE(o);\n";
+            o << "            __u8 *p = (__u8 *)app_payload + o;\n";
+            o << "            if (p + " << M << " <= (__u8 *)data_end) {\n";
+            o << "                __u32 t = " << mismatch << ";\n";
+            o << "                alive &= (t + 0xFF) >> 8;\n";
+            o << "                n += alive;\n";
+            if (f.trim_whitespace) {
+                // Trimming rides along in the same pass.  After the update above, `alive` is 1 exactly
+                // while byte i is still part of the value (the marker has not started at or before i),
+                // so no second pass that needs the final length is necessary:
+                //   lead = number of leading blanks, last = end (index + 1) of the last non-blank byte.
+                // DSL_OPAQUE hides "x & -flag" from the optimizer: BPF has no conditional move, so clang
+                // would otherwise turn it into a real branch per byte and bring the path explosion back.
+                // (An earlier two-pass version spilled one stack slot per iteration and blew the 512-byte
+                // stack limit, and needed twice the instructions.)
+                o << "                __u32 b = p[0];\n";
+                o << "                __u32 not_blank = (((b ^ 0x20) + 0xFF) >> 8) & (((b ^ 0x09) + 0xFF) >> 8); // not ' ' and not '\\t'\n";
+                o << "                lead_alive &= (not_blank ^ 1) & alive;\n";
+                o << "                lead += lead_alive;\n";
+                o << "                __u32 take = 0 - (not_blank & alive);\n";
+                o << "                DSL_OPAQUE(take);\n";
+                o << "                last += ((__u32)(i + 1) - last) & take;\n";
+            }
+            o << "            }\n";
+            o << "        }\n";
+            o << "        if (alive || n > " << f.max_size << ") return XDP_PASS;\n";
+            if (f.trim_whitespace) {
+                o << "        __s32 d = (__s32)last - (__s32)lead;\n";
+                o << "        __u32 neg = (__u32)(d >> 31);\n";
+                o << "        DSL_OPAQUE(neg);\n";
+                o << "        " << name << "_off = (__u16)(off0 + lead);\n";
+                o << "        " << name << "_len = (__u16)((__u32)d & ~neg);\n";
+            } else {
+                o << "        " << name << "_off = (__u16)off0;\n";
+                o << "        " << name << "_len = (__u16)n;\n";
+            }
+            o << "        cursor = (__u8 *)app_payload + ((off0 + n + " << M << ") & 0x3FFF);\n";
+            o << "    }\n";
+            ++i;
+        }
     }
 
     std::string code = o.str();
@@ -204,7 +291,7 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
             field_json["is_view"] = false;
             field_json["is_array"] = false;
 
-            if (r_field.kind == FieldKind::LENGTH_PREFIXED) {
+            if (r_field.kind == FieldKind::LENGTH_PREFIXED || r_field.kind == FieldKind::DELIMITER) {
                 // Variable-length bytes are not copied; the record keeps where they are.
                 field_json["is_view"] = true;
             } else if (!is_scalar_field(r_field.data_type, r_field.max_size)) {
@@ -316,6 +403,9 @@ const char* TEMPLATE_TRACER_C = R"(
 
 // Unaligned-safe load of a fixed-size value from packet memory.
 #define DSL_LOAD(type, p) ({ type _v; __builtin_memcpy(&_v, (p), sizeof(_v)); _v; })
+
+// Emits no instruction, but stops the compiler from seeing through `x`.
+#define DSL_OPAQUE(x) __asm__ __volatile__("" : "+r"(x))
 
 SEC("xdp")
 int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {

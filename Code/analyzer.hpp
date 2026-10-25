@@ -394,8 +394,14 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
                     if (concrete.marker.empty()) {
                         throw std::runtime_error("Semantic Error: " + where + ": delimiter marker must not be empty");
                     }
-                    if (concrete.max_bytes == 0) {
-                        throw std::runtime_error("Semantic Error: " + where + ": max_bytes must be greater than 0");
+                    if (concrete.marker.size() > 8) {
+                        throw std::runtime_error("Semantic Error: " + where + ": delimiter marker is " +
+                                                 std::to_string(concrete.marker.size()) + " bytes; at most 8 are supported");
+                    }
+                    // The scan is unrolled into the program, so the cap also bounds program size and
+                    // verifier work; anything beyond one MTU-sized packet would be pointless anyway.
+                    if (concrete.max_bytes == 0 || concrete.max_bytes > 1500) {
+                        throw std::runtime_error("Semantic Error: " + where + ": delimiter max_bytes must be between 1 and 1500");
                     }
                     r_field.kind = FieldKind::DELIMITER;
                     r_field.is_dynamic = true;

@@ -78,6 +78,56 @@ inline FilterOp parse_filter_op(const std::string& op_str, const std::string& co
     throw std::runtime_error("Parsing Error [" + context + "]: Unknown FilterOp '" + op_str + "'");
 }
 
+// Delimiter markers are raw bytes, so they must NOT be trimmed (" " is a perfectly good marker).
+// Double-quoted YAML strings already turn "\r\n" / "\x00" into real bytes; for single-quoted or
+// plain strings ('\r\n') the usual escapes are accepted here too: \r \n \t \\ \0 and \xHH.
+inline std::string unescape_marker(const std::string& s, const std::string& context) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '\\') { out += s[i]; continue; }
+        if (++i >= s.size()) {
+            throw std::runtime_error("Parsing Error [" + context + "]: marker ends with a lone backslash");
+        }
+        switch (s[i]) {
+            case 'r':  out += '\r'; break;
+            case 'n':  out += '\n'; break;
+            case 't':  out += '\t'; break;
+            case '0':  out += '\0'; break;
+            case '\\': out += '\\'; break;
+            case 'x': {
+                // needs s[i+1] and s[i+2] to exist and be hex digits
+                if (i + 2 >= s.size() || !std::isxdigit(static_cast<unsigned char>(s[i + 1])) ||
+                    !std::isxdigit(static_cast<unsigned char>(s[i + 2]))) {
+                    throw std::runtime_error("Parsing Error [" + context + "]: '\\x' in marker needs two hex digits");
+                }
+                out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
+                i += 2;
+                break;
+            }
+            default:
+                throw std::runtime_error(std::string("Parsing Error [") + context + "]: unknown escape '\\" + s[i] +
+                                         "' in marker (use \\r \\n \\t \\0 \\\\ or \\xHH)");
+        }
+    }
+    return out;
+}
+
+inline std::string parse_marker(const YAML::Node& node, const std::string& context) {
+    if (!node["marker"] || node["marker"].IsNull()) {
+        throw std::runtime_error("Parsing Error [" + context + "]: Missing required key 'marker'");
+    }
+    std::string marker;
+    try {
+        marker = unescape_marker(node["marker"].as<std::string>(), context);
+    } catch (const YAML::Exception& e) {
+        throw std::runtime_error("Parsing Error [" + context + "]: Failed to parse value for key 'marker' (" + e.what() + ")");
+    }
+    if (marker.empty()) {
+        throw std::runtime_error("Parsing Error [" + context + "]: marker must not be empty");
+    }
+    return marker;
+}
+
 // Parse Individual Field Nodes
 inline FieldNode parse_field(const std::string& field_name, const YAML::Node& node) {
     std::string context = "Field '" + field_name + "'";
@@ -114,7 +164,7 @@ inline FieldNode parse_field(const std::string& field_name, const YAML::Node& no
         field.name = field_name;
         field.offset_expr = offset_expr;
         field.data_type = parse_data_type(raw_data_type, DataType::STRING);
-        field.marker = get_required_field<std::string>(node, "marker", context);
+        field.marker = parse_marker(node, context);
         field.max_bytes = get_optional_field<uint32_t>(node, "max_bytes").value_or(128);
         field.trim_whitespace = get_optional_field<bool>(node, "trim_whitespace").value_or(false);
         return field;

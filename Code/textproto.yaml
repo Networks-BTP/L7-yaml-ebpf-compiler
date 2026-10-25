@@ -1,0 +1,37 @@
+# Delimiter-based (text) parsing mixed with binary fields.
+#
+#   Request: "<method> <uri> <version>\r\n"                      (3 delimiter fields, one marker is 2 bytes)
+#   Header:  "<name>:<value>\r\n"   -- value has blanks trimmed   (used twice: h1, h2)
+#   Frame:   tag(1) name\0 len(2) body(len, at most 32) end(1)    (delimiter + fixed + length-prefixed)
+
+protocol: textproto
+transport: tcp
+port: 7002
+
+types:
+  Request:
+    fields:
+      method:  { type: delimiter, marker: " ",    max_bytes: 8 }
+      uri:     { type: delimiter, marker: " ",    max_bytes: 128 }
+      version: { type: delimiter, marker: "\r\n", max_bytes: 16 }
+  Header:
+    fields:
+      name:    { type: delimiter, marker: ":",    max_bytes: 32 }
+      value:   { type: delimiter, marker: '\r\n', max_bytes: 128, trim_whitespace: true }
+  Frame:
+    fields:
+      tag:     { type: fixed, size: 1 }
+      name:    { type: delimiter, marker: "\x00", max_bytes: 16 }
+      len:     { type: fixed, size: 2 }
+      body:    { type: length_prefixed, length_field: len, max_bytes: 32 }
+      end:     { type: fixed, size: 1 }
+
+layout:
+  - name: req
+    type: Request
+  - name: h1
+    type: Header
+  - name: h2
+    type: Header
+  - name: frame
+    type: Frame
