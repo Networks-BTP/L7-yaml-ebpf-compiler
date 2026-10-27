@@ -262,8 +262,9 @@ inline std::string emit_dynamic_parse(const DSLAnalyzer::ResolvedContext& ctx,
 }
 
 // 1. Context to JSON Mapper
-inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
+inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool telemetry = false) {
     json data;
+    data["telemetry"] = telemetry;
     std::string upper = ctx.protocol_name;
     std::transform(upper.begin(), upper.end(), upper.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -313,7 +314,38 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
         l_json["type_ref"] = l_inst.type_ref;
         l_json["c_struct"] = c_struct_name(r_type);
         l_json["is_dynamic"] = r_type.is_dynamic;
-        l_json["parse_code"] = r_type.is_dynamic ? emit_dynamic_parse(ctx, l_inst) : "";
+        std::string parse_code = r_type.is_dynamic ? emit_dynamic_parse(ctx, l_inst) : "";
+        if (telemetry) {
+            // Every early exit of the message parser becomes a counted rejection.
+            const std::string from = "return XDP_PASS;", to = "DSL_REJECT;";
+            for (size_t p = 0; (p = parse_code.find(from, p)) != std::string::npos; p += to.size())
+                parse_code.replace(p, from.size(), to);
+        }
+        l_json["parse_code"] = parse_code;
+
+        // Field descriptions for the generated user-space decoder (telemetry mode).
+        l_json["fields"] = json::array();
+        for (const auto& f : r_type.ordered_fields) {
+            json fj;
+            fj["name"] = f.name;
+            if (f.kind == FieldKind::LENGTH_PREFIXED || f.kind == FieldKind::DELIMITER) {
+                fj["kind"] = "view";
+            } else if (is_scalar_field(f.data_type, f.max_size)) {
+                fj["kind"] = "scalar";
+                // The overlay of a static type holds wire (big-endian) bytes; dynamic records are host order.
+                std::string swap;
+                if (!r_type.is_dynamic) {
+                    if (f.max_size == 2) swap = "be16toh";
+                    else if (f.max_size == 4) swap = "be32toh";
+                    else if (f.max_size == 8) swap = "be64toh";
+                }
+                fj["swap"] = swap;
+            } else {
+                fj["kind"] = "array";
+                fj["size"] = f.max_size;
+            }
+            l_json["fields"].push_back(fj);
+        }
         data["layout"].push_back(l_json);
     }
 
@@ -368,7 +400,7 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx) {
 
 // 2. Jinja Templates
 
-const char* TEMPLATE_COMMON_H = R"(
+const char* TEMPLATE_COMMON_H = R"TPL(
 #ifndef {{ protocol_upper }}_COMMON_H
 #define {{ protocol_upper }}_COMMON_H
 
@@ -388,10 +420,80 @@ struct {{ struct.c_name }} {
 }{{ struct.attr }};
 
 ## endfor
-#endif // {{ protocol_upper }}_COMMON_H
-)";
+## if telemetry
+// ---- Telemetry ------------------------------------------------------------------------------
+// One event is sent through the perf event array `dsl_events` for every message that was parsed
+// completely and passed all filters.  The perf record is
+//     [ struct {{ protocol }}_event ][ first dsl_snap_len bytes of the packet, starting at the Ethernet header ]
+// so the offsets stored in the records (relative to the application payload) can be turned into
+// text by the consumer: packet byte = pkt[dsl_app_off + <field>_off].
+#define DSL_SNAP_LEN 512
 
-const char* TEMPLATE_TRACER_C = R"(
+struct {{ protocol }}_event {
+    __u32 dsl_pkt_len;    // length of the whole packet
+    __u32 dsl_snap_len;   // how many packet bytes follow this struct
+    __u32 dsl_app_off;    // where the application payload starts inside those bytes
+    __u32 dsl_src_ip;     // IPv4 addresses, network byte order
+    __u32 dsl_dst_ip;
+    __u16 dsl_src_port;   // transport ports, host byte order
+    __u16 dsl_dst_port;
+## for item in layout
+    struct {{ item.c_struct }} {{ item.instance_name }};
+## endfor
+};
+
+#define DSL_EVENT_T struct {{ protocol }}_event
+
+// The event is built on the BPF stack (512 bytes in total).
+_Static_assert(sizeof(DSL_EVENT_T) <= 256, "event too large for the BPF stack; reduce the layout or caps");
+
+// Counters in the per-CPU array `dsl_stats` (indices):
+#define DSL_STAT_MATCHED  0   // transport + port matched and the segment carries payload
+#define DSL_STAT_PARSED   1   // layout parsed completely and every filter passed (an event was sent)
+#define DSL_STAT_REJECTED 2   // truncated, over a cap, or marker not found
+#define DSL_STAT_FILTERED 3   // parsed, but a filter said no
+#define DSL_STAT_COUNT    4
+
+#ifdef DSL_USERSPACE
+#include <endian.h>
+#include <stdio.h>
+
+static inline void dsl_put_bytes(const unsigned char *pkt, __u32 snap, __u32 off, __u32 len) {
+    putchar('"');
+    for (__u32 i = 0; i < len; i++) {
+        if (off + i >= snap) { fputs("\\\"...(beyond snapshot)", stdout); return; }
+        unsigned char c = pkt[off + i];
+        if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') putchar(c);
+        else printf("\\x%02x", c);
+    }
+    putchar('"');
+}
+
+static inline void dsl_put_hex(const unsigned char *b, __u32 len) {
+    for (__u32 i = 0; i < len; i++) printf("%02x", b[i]);
+}
+
+// Prints every parsed field of one event as  instance.field=value  (text fields quoted).
+static inline void dsl_print_event(const DSL_EVENT_T *ev, const unsigned char *pkt) {
+## for item in layout
+## for f in item.fields
+## if f.kind == "view"
+    printf(" {{ item.instance_name }}.{{ f.name }}="); dsl_put_bytes(pkt, ev->dsl_snap_len, ev->dsl_app_off + ev->{{ item.instance_name }}.{{ f.name }}_off, ev->{{ item.instance_name }}.{{ f.name }}_len);
+## else if f.kind == "scalar"
+    printf(" {{ item.instance_name }}.{{ f.name }}=%llu", (unsigned long long){% if f.swap != "" %}{{ f.swap }}{% endif %}(ev->{{ item.instance_name }}.{{ f.name }}));
+## else
+    printf(" {{ item.instance_name }}.{{ f.name }}="); dsl_put_hex((const unsigned char *)ev->{{ item.instance_name }}.{{ f.name }}, {{ f.size }});
+## endif
+## endfor
+## endfor
+}
+#endif // DSL_USERSPACE
+## endif
+
+#endif // {{ protocol_upper }}_COMMON_H
+)TPL";
+
+const char* TEMPLATE_TRACER_C = R"TPL(
 #include "common.h"
 #include <linux/if_ether.h>
 #include <linux/in.h>
@@ -406,6 +508,29 @@ const char* TEMPLATE_TRACER_C = R"(
 
 // Emits no instruction, but stops the compiler from seeing through `x`.
 #define DSL_OPAQUE(x) __asm__ __volatile__("" : "+r"(x))
+## if telemetry
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} dsl_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, DSL_STAT_COUNT);
+    __type(key, __u32);
+    __type(value, __u64);
+} dsl_stats SEC(".maps");
+
+static __always_inline void dsl_count(__u32 idx) {
+    __u64 *v = bpf_map_lookup_elem(&dsl_stats, &idx);
+    if (v) (*v)++;
+}
+
+// A message that cannot be parsed (truncated, over a cap, marker missing): count it, let the packet pass.
+#define DSL_REJECT do { dsl_count(DSL_STAT_REJECTED); return XDP_PASS; } while (0)
+## endif
 
 SEC("xdp")
 int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
@@ -436,6 +561,11 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
     void *app_payload = (void *)(l4 + 1);
 ## endif
 
+## if telemetry
+    if ((__u8 *)app_payload >= (__u8 *)data_end) return XDP_PASS;   // no payload (e.g. a bare ACK)
+    dsl_count(DSL_STAT_MATCHED);
+## endif
+
     // 3. Application Protocol Layout Parsing
     void *cursor = app_payload;
 
@@ -446,7 +576,7 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 {{ item.parse_code }}
 ## else
     struct {{ item.c_struct }} *{{ item.instance_name }} = cursor;
-    if ((void *)({{ item.instance_name }} + 1) > data_end) return XDP_PASS;
+    if ((void *)({{ item.instance_name }} + 1) > data_end) {% if telemetry %}DSL_REJECT{% else %}return XDP_PASS{% endif %};
     cursor = (void *)({{ item.instance_name }} + 1);
 ## endif
 
@@ -454,21 +584,216 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 
     // 4. Observability Filters
 ## for f in filters
-    if (!({{ f.lhs }} {{ f.op }} {{ f.value }})) return XDP_PASS;
+    if (!({{ f.lhs }} {{ f.op }} {{ f.value }})) {% if telemetry %}{ dsl_count(DSL_STAT_FILTERED); return XDP_PASS; }{% else %}return XDP_PASS;{% endif %}
 ## endfor
 
     // Payload successfully parsed and matched!
-    // (Telemetry emission / Ringbuf logic would go here)
+## if telemetry
+    {
+        DSL_EVENT_T ev = {};
+        __u32 pkt_len = (__u32)((__u8 *)data_end - (__u8 *)data);
+        __u32 snap = pkt_len < DSL_SNAP_LEN ? pkt_len : DSL_SNAP_LEN;
+        ev.dsl_pkt_len = pkt_len;
+        ev.dsl_snap_len = snap;
+        ev.dsl_app_off = (__u32)((__u8 *)app_payload - (__u8 *)data);
+        ev.dsl_src_ip = ip->saddr;
+        ev.dsl_dst_ip = ip->daddr;
+        ev.dsl_src_port = bpf_ntohs(l4->source);
+        ev.dsl_dst_port = bpf_ntohs(l4->dest);
+## for item in layout
+## if item.is_dynamic
+        ev.{{ item.instance_name }} = {{ item.instance_name }};
+## else
+        ev.{{ item.instance_name }} = *{{ item.instance_name }};
+## endif
+## endfor
+        dsl_count(DSL_STAT_PARSED);
+        // The upper 32 bits of the flags ask the kernel to append that many packet bytes to the record.
+        bpf_perf_event_output(ctx, &dsl_events, BPF_F_CURRENT_CPU | ((__u64)snap << 32), &ev, sizeof(ev));
+    }
+## else
+    // (Telemetry emission is off: generate with --telemetry to get counters and events.)
+## endif
 
     return XDP_PASS;
 }
 
 char _license[] SEC("license") = "GPL";
-)";
+)TPL";
+
+
+const char* TEMPLATE_LOADER_C = R"LOADER(// loader.c -- generated by dslc (--telemetry).  Attaches tracer.bpf.o to an interface and prints
+// every parsed {{ protocol }} message that the XDP program reports.
+//
+//   sudo ./loader [-o tracer.bpf.o] [-g] [-c] [-q] [-v] [-s SECONDS] <interface>
+//     -g  force generic (skb) XDP mode; works with any NIC and driver
+//     -c  print only messages sent TO port {{ port }} (clients' requests), not the replies coming from it
+//     -v  print how much of the kernel verifier's budget the program used
+//     -q  do not print events, only the counters
+//     -s  print the counters every SECONDS seconds (they are always printed at exit)
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <linux/if_link.h>
+#include <net/if.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#define DSL_USERSPACE
+#include "common.h"
+
+#if defined(LIBBPF_MAJOR_VERSION) && (LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 8)
+#define DSL_XDP_ATTACH(ifx, fd, fl) bpf_xdp_attach((ifx), (fd), (fl), NULL)
+#else
+#define DSL_XDP_ATTACH(ifx, fd, fl) bpf_set_link_xdp_fd((ifx), (fd), (fl))
+#endif
+
+static volatile sig_atomic_t g_stop;
+static int g_quiet, g_client_only;
+#define DSL_PORT {{ port }}
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+static void on_event(void *ctx, int cpu, void *data, __u32 size) {
+    (void)ctx;
+    const DSL_EVENT_T *ev = data;
+    if (size < sizeof(*ev) || size < sizeof(*ev) + ev->dsl_snap_len) {
+        fprintf(stderr, "short event (%u bytes), ignored\n", size);
+        return;
+    }
+    if (g_quiet) return;
+    if (g_client_only && ev->dsl_dst_port != DSL_PORT) return;
+    char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &ev->dsl_src_ip, src, sizeof(src));
+    inet_ntop(AF_INET, &ev->dsl_dst_ip, dst, sizeof(dst));
+    printf("cpu%d %s:%u -> %s:%u len=%u", cpu, src, ev->dsl_src_port, dst, ev->dsl_dst_port, ev->dsl_pkt_len);
+    dsl_print_event(ev, (const unsigned char *)(ev + 1));
+    putchar('\n');
+    fflush(stdout);
+}
+
+static void on_lost(void *ctx, int cpu, __u64 cnt) {
+    (void)ctx;
+    fprintf(stderr, "lost %llu events on cpu%d\n", (unsigned long long)cnt, cpu);
+}
+
+static void print_stats(int stats_fd, int ncpu) {
+    static const char *names[DSL_STAT_COUNT] = {"matched", "parsed", "rejected", "filtered"};
+    __u64 *vals = calloc(ncpu, sizeof(__u64));
+    if (!vals) return;
+    printf("stats:");
+    for (__u32 k = 0; k < DSL_STAT_COUNT; k++) {
+        unsigned long long sum = 0;
+        if (bpf_map_lookup_elem(stats_fd, &k, vals) == 0)
+            for (int c = 0; c < ncpu; c++) sum += vals[c];
+        printf(" %s=%llu", names[k], sum);
+    }
+    putchar('\n');
+    fflush(stdout);
+    free(vals);
+}
+
+int main(int argc, char **argv) {
+    const char *obj_path = "tracer.bpf.o";
+    int skb_mode = 0, interval = 0, verbose = 0, opt;
+    while ((opt = getopt(argc, argv, "o:gcqvs:")) != -1) {
+        if (opt == 'o') obj_path = optarg;
+        else if (opt == 'g') skb_mode = 1;
+        else if (opt == 'c') g_client_only = 1;
+        else if (opt == 'q') g_quiet = 1;
+        else if (opt == 'v') verbose = 1;
+        else if (opt == 's') interval = atoi(optarg);
+        else { fprintf(stderr, "usage: %s [-o obj] [-g] [-c] [-q] [-v] [-s sec] <interface>\n", argv[0]); return 2; }
+    }
+    if (optind >= argc) { fprintf(stderr, "usage: %s [-o obj] [-g] [-c] [-q] [-v] [-s sec] <interface>\n", argv[0]); return 2; }
+    const char *ifname = argv[optind];
+    int ifindex = (int)if_nametoindex(ifname);
+    if (!ifindex) { fprintf(stderr, "unknown interface '%s'\n", ifname); return 1; }
+
+    static char vlog[16 << 20];
+    LIBBPF_OPTS(bpf_object_open_opts, open_opts);
+    if (verbose) {
+        open_opts.kernel_log_buf = vlog;
+        open_opts.kernel_log_size = sizeof(vlog);
+        open_opts.kernel_log_level = 1;
+    }
+    struct bpf_object *obj = bpf_object__open_file(obj_path, &open_opts);
+    if (!obj || libbpf_get_error(obj)) { fprintf(stderr, "cannot open %s\n", obj_path); return 1; }
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "loading failed (the kernel verifier log is printed above)\n");
+        return 1;
+    }
+    if (verbose) {
+        const char *p = strstr(vlog, "processed "), *last = NULL;
+        while (p) { last = p; p = strstr(p + 1, "processed "); }
+        if (last) printf("verifier: %.*s\n", (int)strcspn(last, "\n"), last);
+        else printf("verifier: accepted (no statistics line in the log)\n");
+    }
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_{{ protocol }}_parser");
+    struct bpf_map *events = bpf_object__find_map_by_name(obj, "dsl_events");
+    struct bpf_map *stats = bpf_object__find_map_by_name(obj, "dsl_stats");
+    if (!prog || !events || !stats) { fprintf(stderr, "%s does not look like dslc --telemetry output\n", obj_path); return 1; }
+    int ncpu = libbpf_num_possible_cpus();
+
+#if defined(LIBBPF_MAJOR_VERSION) && (LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 7)
+    struct perf_buffer *pb = perf_buffer__new(bpf_map__fd(events), 64, on_event, on_lost, NULL, NULL);
+#else
+    struct perf_buffer_opts pb_opts = {};
+    pb_opts.sample_cb = on_event;
+    pb_opts.lost_cb = on_lost;
+    struct perf_buffer *pb = perf_buffer__new(bpf_map__fd(events), 64, &pb_opts);
+#endif
+    if (!pb || libbpf_get_error(pb)) { fprintf(stderr, "cannot create the perf buffer\n"); return 1; }
+
+    unsigned flags = XDP_FLAGS_UPDATE_IF_NOEXIST | (skb_mode ? XDP_FLAGS_SKB_MODE : 0);
+    int err = DSL_XDP_ATTACH(ifindex, bpf_program__fd(prog), flags);
+    if (err) {
+        fprintf(stderr, "attaching to %s failed: %s%s\n", ifname, strerror(-err),
+                err == -EEXIST ? " (another XDP program is attached: ip link set dev IF xdp off)" : "");
+        return 1;
+    }
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    fprintf(stderr, "attached to %s (%s mode); Ctrl-C to stop\n", ifname, skb_mode ? "generic" : "driver if supported, else generic");
+
+    time_t last = time(NULL);
+    while (!g_stop) {
+        int n = perf_buffer__poll(pb, 200);
+        if (n < 0 && n != -EINTR) { fprintf(stderr, "poll error: %s\n", strerror(-n)); break; }
+        if (interval && time(NULL) - last >= interval) { print_stats(bpf_map__fd(stats), ncpu); last = time(NULL); }
+    }
+    perf_buffer__poll(pb, 0);
+    print_stats(bpf_map__fd(stats), ncpu);
+    DSL_XDP_ATTACH(ifindex, -1, skb_mode ? XDP_FLAGS_SKB_MODE : 0);
+    perf_buffer__free(pb);
+    bpf_object__close(obj);
+    return 0;
+}
+)LOADER";
+
+const char* TEMPLATE_MAKEFILE = R"MAKEFILE(# Generated by dslc (--telemetry).  Needs: clang, libbpf-dev, gcc, libelf-dev, zlib1g-dev
+ARCH := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+MULTIARCH := $(shell gcc -print-multiarch 2>/dev/null)
+
+all: tracer.bpf.o loader
+
+tracer.bpf.o: tracer.bpf.c common.h
+	clang -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -I/usr/include/$(MULTIARCH) -c tracer.bpf.c -o tracer.bpf.o
+
+loader: loader.c common.h
+	gcc -O2 -Wall loader.c -o loader -lbpf -lelf -lz
+
+clean:
+	rm -f tracer.bpf.o loader
+)MAKEFILE";
 
 // 3. Execution Function
-inline void generate(const DSLAnalyzer::ResolvedContext& ctx, const std::string& out_dir = ".") {
-    json data = build_template_context(ctx);
+inline void generate(const DSLAnalyzer::ResolvedContext& ctx, const std::string& out_dir = ".", bool telemetry = false) {
+    json data = build_template_context(ctx, telemetry);
     inja::Environment env;
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
@@ -486,6 +811,16 @@ inline void generate(const DSLAnalyzer::ResolvedContext& ctx, const std::string&
     out_c << tracer_c;
     out_c.close();
 
+    if (telemetry) {
+        std::ofstream out_l(out_dir + "/loader.c");
+        if (!out_l) throw std::runtime_error("Codegen Error: cannot write " + out_dir + "/loader.c");
+        out_l << env.render(TEMPLATE_LOADER_C, data);
+        std::ofstream out_m(out_dir + "/Makefile");
+        if (!out_m) throw std::runtime_error("Codegen Error: cannot write " + out_dir + "/Makefile");
+        out_m << TEMPLATE_MAKEFILE;
+        std::cout << "[Codegen] Successfully generated common.h, tracer.bpf.c, loader.c and Makefile (telemetry on)\n";
+        return;
+    }
     std::cout << "[Codegen] Successfully generated common.h and tracer.bpf.c\n";
 }
 

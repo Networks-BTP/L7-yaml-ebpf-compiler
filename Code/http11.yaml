@@ -1,0 +1,34 @@
+# HTTP/1.1 request parsing for testing the YAML-to-eBPF compiler.
+#
+# Request line:
+#   <method> <request-target> <version>\r\n
+#
+# Headers:
+#   <name>: <value>\r\n
+#
+# This initial specification parses the request line and two headers.
+# It does not parse the HTTP body or the end-of-headers marker.
+
+protocol: http11
+transport: tcp
+port: 8080
+
+types:
+  Request:
+    fields:
+      method:  { type: delimiter, marker: " ", max_bytes: 8 }
+      uri:     { type: delimiter, marker: " ", max_bytes: 128 }
+      version: { type: delimiter, marker: "\r\n", max_bytes: 16 }
+
+  Header:
+    fields:
+      name:  { type: delimiter, marker: ":", max_bytes: 32 }
+      value: { type: delimiter, marker: "\r\n", max_bytes: 128, trim_whitespace: true }
+
+layout:
+  - name: req
+    type: Request
+  - name: h1
+    type: Header
+  - name: h2
+    type: Header

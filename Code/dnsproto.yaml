@@ -1,0 +1,23 @@
+
+protocol: dns
+transport: udp
+port: 53
+
+types:
+  DNSHeader:
+    fields:
+      transaction_id:  { type: fixed, size: 2 }
+      flags:           { type: fixed, size: 2 }
+      question_count:  { type: fixed, size: 2 }
+      answer_count:    { type: fixed, size: 2 }
+      authority_count: { type: fixed, size: 2 }
+      additional_count: { type: fixed, size: 2 }
+
+layout:
+  - name: dns_header
+    type: DNSHeader
+
+filters:
+  - field: dns_header.question_count
+    op: ">"
+    value: "0"

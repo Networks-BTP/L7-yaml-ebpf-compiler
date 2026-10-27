@@ -6,15 +6,24 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <protocol.yaml> [output_dir]\n";
+    bool telemetry = false;
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--telemetry") telemetry = true;
+        else positional.push_back(a);
+    }
+    if (positional.empty() || positional.size() > 2) {
+        std::cerr << "Usage: " << argv[0] << " [--telemetry] <protocol.yaml> [output_dir]\n"
+                  << "  --telemetry  also generate event/counter reporting, loader.c and a Makefile\n";
         return 2;
     }
 
-    const std::string input_path = argv[1];
-    const std::string out_dir = (argc >= 3) ? argv[2] : ".";
+    const std::string input_path = positional[0];
+    const std::string out_dir = (positional.size() >= 2) ? positional[1] : ".";
 
     std::ifstream in(input_path);
     if (!in) {
@@ -45,7 +54,7 @@ int main(int argc, char** argv) {
         }
 
         // 3. Resolved context -> C files
-        DSLCodeGen::generate(ctx, out_dir);
+        DSLCodeGen::generate(ctx, out_dir, telemetry);
     } catch (const YAML::Exception& e) {
         std::cerr << "YAML Error: " << e.what() << "\n";
         return 1;
