@@ -1,0 +1,36 @@
+protocol: repeated_test
+transport: udp
+port: 5000
+
+types:
+  InnerLeaf:
+    fields:
+      f_static: { type: fixed, size: 2 }
+      f_dyn:    { type: delimiter, marker: ";", max_bytes: 32 }
+      f_after:  { type: fixed, size: 4 }
+
+  Level2:
+    fields:
+      InnerLeaf: { type: InnerLeaf }
+
+  Header:
+    fields:
+      type1: { type: Level2 }
+      type2: { type: Level2 }
+
+layout:
+  - name: inst1
+    type: Header
+  - name: inst2
+    type: Header
+
+filters:
+  - field: inst1.type1.InnerLeaf.f_static
+    op: "=="
+    value: "10"
+  - field: inst1.type2.InnerLeaf.f_after
+    op: "!="
+    value: "0"
+  - field: inst2.type1.InnerLeaf.f_static
+    op: "=="
+    value: "20"

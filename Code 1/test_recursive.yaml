@@ -1,0 +1,46 @@
+protocol: recursivetest
+transport: udp
+port: 8080
+
+types:
+  InnerA:
+    fields:
+      f1: { type: fixed, size: 2 }
+      f2: { type: fixed, size: 4 }
+
+  InnerC:
+    fields:
+      flag: { type: fixed, size: 1 }
+      token: { type: delimiter, marker: "\n", max_bytes: 64 }
+
+  InnerB:
+    fields:
+      prefix_id: { type: fixed, size: 2 }
+      inner_c:   { type: InnerC }
+      suffix_id: { type: fixed, size: 2 }
+
+  Header:
+    fields:
+      magic:     { type: fixed, size: 2 }
+      partA:     { type: InnerA }
+      partB:     { type: InnerB }
+      checksum:  { type: fixed, size: 4 }
+
+  Body:
+    fields:
+      payload_len: { type: varint, max_bytes: 5 }
+      extra_flag:  { type: fixed, size: 2 }
+
+layout:
+  - name: hdr
+    type: Header
+  - name: body
+    type: Body
+
+filters:
+  - field: hdr.partA.f1
+    op: "=="
+    value: "42"
+  - field: hdr.partB.inner_c.flag
+    op: "!="
+    value: "0"
