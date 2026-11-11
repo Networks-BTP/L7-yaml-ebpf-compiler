@@ -5,7 +5,7 @@ sudo apt install -y build-essential cmake git clang libbpf-dev
 
 2. Copy the project to your Linux home (faster than /mnt/c)
 
-cp -r /mnt/c/Users/HP/btp/L7-yaml-ebpf-compiler/cODE ~/dslc
+cp -r /mnt/c/Users/HP/btp/L7-yaml-ebpf-compiler/Code ~/dslc
 cd ~/dslc
 
 If you’ve edited files on the Windows side since, copy them over again (or just re-run the cp -r).
@@ -21,6 +21,8 @@ The first configure downloads yaml-cpp, nlohmann_json and inja, so it takes a bi
 4. Run it on your YAML
 
 ./build/dslc trialproto.yaml out
+With telemetry 
+./build/dslc --telemetry trialproto.yaml out
 
 This writes out/common.h and out/tracer.bpf.c.
 
@@ -36,3 +38,38 @@ If it succeeds, tracer.bpf.o exists and the section list shows xdp and license.
 6. Copy results back to Windows (optional)
 
 cp -r out /mnt/c/Users/HP/btp/L7-yaml-ebpf-compiler/cODE/out
+
+To fix version error
+struct bpf_object_open_opts open_opts = {
+    .sz = sizeof(struct bpf_object_open_opts)
+};
+
+DNS Live Packets 
+Terminal 1
+sudo ./loader -g -c -s 2 eno33np0
+
+Terminal 2
+dig @8.8.8.8 google.com
+dig @1.1.1.1 example.com
+dig @8.8.8.8 youtube.com
+dig @1.1.1.1 cloudflare.com
+
+HTTP1.1 Live Packets 
+Terminal 1
+sudo ip netns add client
+sudo ip link add veth-host type veth peer name veth-client
+sudo ip link set veth-client netns client
+sudo ip addr add 10.10.10.1/24 dev veth-host
+sudo ip link set veth-host up
+sudo ip netns exec client ip addr add 10.10.10.2/24 dev veth-client
+sudo ip netns exec client ip link set veth-client up
+sudo ip netns exec client ip link set lo up
+sudo ip netns exec client curl -v http://10.10.10.1:8080/test
+
+Terminal 2
+nc -lv 8080
+
+Terminal 3
+sudo ./loader -g -c -s 2 veth-host
+
+explorer.exe .

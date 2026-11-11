@@ -87,7 +87,15 @@ struct LayoutNode {
     // Rule 2: Optional layout offset expression.
     // If std::nullopt, starts immediately after preceding layout instance in packet stream.
     std::optional<std::string> offset_expr;
-    
+
+    // Bounded repetition: the instance is parsed up to N times back to back.
+    //   repeat: 3                        -> constant count (max_repeat not allowed)
+    //   repeat: dns_header.answer_count  -> count read from an earlier instance's field;
+    //                                       max_repeat is then mandatory (hard cap for the verifier)
+    // A count above max_repeat rejects the message.
+    std::optional<std::string> repeat_expr;
+    std::optional<uint32_t> max_repeat;
+
     // std::optional<std::string> condition;
 };
 

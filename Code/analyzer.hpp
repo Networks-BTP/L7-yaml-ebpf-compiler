@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -77,10 +78,20 @@ struct ExternalLength {
     int32_t addend{0};
 };
 
+// Bounded repetition of a layout instance (see LayoutNode::repeat_expr).
+struct RepeatSpec {
+    bool is_constant{false};
+    uint32_t constant{0};          // is_constant: the fixed count
+    std::string src_instance;      // !is_constant: earlier, non-repeated instance holding the count ...
+    std::string src_field;         // ... and its fixed 1/2/4/8-byte integer field
+    uint32_t max{0};               // hard cap (== constant when is_constant); a larger count rejects the message
+};
+
 struct ResolvedLayoutInstance {
     std::string instance_name;
     std::string type_ref;
     std::map<std::string, ExternalLength> external_lengths; // keyed by length-prefixed field name
+    std::optional<RepeatSpec> repeat;                       // set when the instance is repeated
 };
 
 struct ResolvedFilter {
@@ -88,6 +99,7 @@ struct ResolvedFilter {
     std::string field_name;
     FilterOp op;
     std::string value;
+    std::optional<uint32_t> index; // element index, for filters on a repeated instance: answers[1].rtype
 };
 
 struct ResolvedContext {
@@ -163,6 +175,29 @@ inline bool split_instance_ref(const std::string& ref, std::string& inst, std::s
     if (ref.find('.', dot + 1) != std::string::npos) return false;
     inst = ref.substr(0, dot);
     field = ref.substr(dot + 1);
+    return true;
+}
+
+// Largest repeat count accepted; every repetition is unrolled into the program.
+constexpr uint32_t MAX_REPEAT_LIMIT = 16;
+
+// Splits a filter target: "inst.field" or "inst[N].field".
+inline bool split_filter_target(const std::string& ref, std::string& inst,
+                                std::optional<uint32_t>& index, std::string& field) {
+    size_t dot = ref.find('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= ref.size()) return false;
+    std::string lhs = ref.substr(0, dot);
+    field = ref.substr(dot + 1);
+    index.reset();
+
+    size_t br = lhs.find('[');
+    if (br == std::string::npos) { inst = lhs; return true; }
+    if (br == 0 || lhs.back() != ']' || br + 2 > lhs.size() - 1) return false;
+    std::string digits = lhs.substr(br + 1, lhs.size() - br - 2);
+    if (digits.empty() || digits.size() > 6 ||
+        !std::all_of(digits.begin(), digits.end(), [](unsigned char c) { return std::isdigit(c); })) return false;
+    inst = lhs.substr(0, br);
+    index = static_cast<uint32_t>(std::stoul(digits));
     return true;
 }
 
@@ -460,6 +495,73 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
         r_inst.instance_name = layout_node.instance_name;
         r_inst.type_ref = layout_node.type_ref;
 
+        if (layout_node.repeat_expr) {
+            const std::string where = "layout instance '" + layout_node.instance_name + "'";
+            const std::string& expr = *layout_node.repeat_expr;
+            if (!type_it->second.is_dynamic) {
+                throw std::runtime_error("Semantic Error: " + where + ": repeat is only supported for types with "
+                                         "variable-length fields (type '" + layout_node.type_ref + "' is fixed-size)");
+            }
+
+            RepeatSpec rs;
+            size_t consumed = 0;
+            unsigned long constant = 0;
+            bool is_number = false;
+            try { constant = std::stoul(expr, &consumed, 0); is_number = consumed == expr.size(); } catch (...) {}
+
+            if (is_number) {
+                if (layout_node.max_repeat) {
+                    throw std::runtime_error("Semantic Error: " + where + ": 'max_repeat' is only for a count read from a "
+                                             "field; a constant repeat is its own cap");
+                }
+                if (expr.find('-') != std::string::npos || constant == 0 || constant > MAX_REPEAT_LIMIT) {
+                    throw std::runtime_error("Semantic Error: " + where + ": constant repeat must be between 1 and " +
+                                             std::to_string(MAX_REPEAT_LIMIT));
+                }
+                rs.is_constant = true;
+                rs.constant = static_cast<uint32_t>(constant);
+                rs.max = rs.constant;
+            } else {
+                std::string src_inst, src_field;
+                if (!split_instance_ref(expr, src_inst, src_field)) {
+                    throw std::runtime_error("Semantic Error: " + where + ": repeat '" + expr +
+                                             "' must be an integer or 'instance.field'");
+                }
+                if (!layout_node.max_repeat || *layout_node.max_repeat == 0 || *layout_node.max_repeat > MAX_REPEAT_LIMIT) {
+                    throw std::runtime_error("Semantic Error: " + where + ": repeat from '" + expr +
+                                             "' needs 'max_repeat' between 1 and " + std::to_string(MAX_REPEAT_LIMIT) +
+                                             " (the eBPF verifier requires a hard cap)");
+                }
+                auto src_it = std::find_if(ctx.layout.begin(), ctx.layout.end(),
+                    [&](const ResolvedLayoutInstance& i) { return i.instance_name == src_inst; });
+                if (src_it == ctx.layout.end()) {
+                    bool exists_later = instance_type.count(src_inst) > 0 && src_inst != layout_node.instance_name;
+                    throw std::runtime_error("Semantic Error: " + where + ": count source instance '" + src_inst + "' " +
+                                             (exists_later ? "comes later in the layout; it must be parsed before this instance"
+                                                           : "does not exist"));
+                }
+                if (src_it->repeat) {
+                    throw std::runtime_error("Semantic Error: " + where + ": count source instance '" + src_inst +
+                                             "' is itself repeated; its fields have no single value");
+                }
+                const ResolvedType& src_type = ctx.types.at(src_it->type_ref);
+                auto sf = src_type.field_map.find(src_field);
+                if (sf == src_type.field_map.end()) {
+                    throw std::runtime_error("Semantic Error: " + where + ": instance '" + src_inst + "' (type '" +
+                                             src_type.name + "') has no field '" + src_field + "'");
+                }
+                if (sf->second.kind != FieldKind::FIXED || sf->second.data_type != DataType::INT ||
+                    !is_scalar_int_size(sf->second.max_size)) {
+                    throw std::runtime_error("Semantic Error: " + where + ": count source '" + expr +
+                                             "' must be a fixed-size integer field (1, 2, 4 or 8 bytes)");
+                }
+                rs.src_instance = src_inst;
+                rs.src_field = src_field;
+                rs.max = *layout_node.max_repeat;
+            }
+            r_inst.repeat = rs;
+        }
+
         for (const auto& f : type_it->second.ordered_fields) {
             if (!f.external_length) continue;
             const std::string where = "length-prefixed field '" + f.name + "' of layout instance '" +
@@ -487,6 +589,10 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
                 throw std::runtime_error("Semantic Error: " + where + ": length source instance '" + src_inst + "' " +
                                          (exists_later ? "comes later in the layout; it must be parsed before this instance"
                                                        : "does not exist"));
+            }
+            if (src_it->repeat) {
+                throw std::runtime_error("Semantic Error: " + where + ": length source instance '" + src_inst +
+                                         "' is repeated; its fields have no single value");
             }
             const ResolvedType& src_type = ctx.types.at(src_it->type_ref);
             auto sf = src_type.field_map.find(src_field);
@@ -521,6 +627,23 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
         ctx.layout.push_back(std::move(r_inst));
     }
 
+    // Repeated instances get a generated `<name>_n` counter; it must not collide with another instance.
+    uint64_t verifier_paths = 1;
+    for (const auto& inst : ctx.layout) {
+        if (!inst.repeat) continue;
+        if (seen_instances.count(inst.instance_name + "_n")) {
+            throw std::runtime_error("Semantic Error: layout instance '" + inst.instance_name + "_n' collides with the "
+                                     "element counter generated for repeated instance '" + inst.instance_name + "'");
+        }
+        if (!inst.repeat->is_constant) verifier_paths *= (inst.repeat->max + 1);
+    }
+    // Each variable-count repetition multiplies the paths the eBPF verifier has to explore.
+    if (verifier_paths > 100) {
+        std::cerr << "[Analyzer] Warning: repeated instances give up to " << verifier_paths
+                  << " parse paths; the kernel verifier may reject the program as too complex "
+                     "(lower max_repeat, or check with the loader's -v)\n";
+    }
+
     // 3. Now that every instance's cap is known, finish the size totals of types with cross-struct lengths.
     for (auto& [key, cap] : external_caps) {
         ResolvedType& t = ctx.types.at(key.first);
@@ -539,14 +662,13 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
 
     // 4. Validate Observability Filters
     for (const auto& filter_node : ast.filters) {
-        size_t dot_pos = filter_node.target_field.find('.');
-        if (dot_pos == std::string::npos) {
+        std::string layout_inst, field_name;
+        std::optional<uint32_t> filter_index;
+        if (!split_filter_target(filter_node.target_field, layout_inst, filter_index, field_name)) {
             throw std::runtime_error("Semantic Error: Filter target '" + filter_node.target_field +
-                                     "' must use 'layout_instance.field_name' format");
+                                     "' must use 'layout_instance.field_name' format "
+                                     "(or 'layout_instance[N].field_name' for a repeated instance)");
         }
-
-        std::string layout_inst = filter_node.target_field.substr(0, dot_pos);
-        std::string field_name = filter_node.target_field.substr(dot_pos + 1);
 
         // Find layout instance
         auto it = std::find_if(ctx.layout.begin(), ctx.layout.end(),
@@ -556,6 +678,22 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
             throw std::runtime_error("Semantic Error: Filter references undefined layout instance '" + layout_inst + "'");
         }
 
+        if (it->repeat) {
+            if (!filter_index) {
+                throw std::runtime_error("Semantic Error: Filter target '" + filter_node.target_field + "': instance '" +
+                                         layout_inst + "' is repeated; select an element, e.g. '" + layout_inst + "[0]." +
+                                         field_name + "'");
+            }
+            if (*filter_index >= it->repeat->max) {
+                throw std::runtime_error("Semantic Error: Filter target '" + filter_node.target_field + "': index " +
+                                         std::to_string(*filter_index) + " is out of range (instance '" + layout_inst +
+                                         "' repeats at most " + std::to_string(it->repeat->max) + " time(s))");
+            }
+        } else if (filter_index) {
+            throw std::runtime_error("Semantic Error: Filter target '" + filter_node.target_field + "': instance '" +
+                                     layout_inst + "' is not repeated, so it cannot be indexed");
+        }
+
         // Validate field exists in the layout's type
         const ResolvedType& target_type = ctx.types.at(it->type_ref);
         if (target_type.field_map.find(field_name) == target_type.field_map.end()) {
@@ -563,7 +701,7 @@ inline ResolvedContext analyze(const ProtocolAST& ast) {
                                      "' not found in type '" + target_type.name + "'");
         }
 
-        ctx.filters.push_back({layout_inst, field_name, filter_node.op, filter_node.value});
+        ctx.filters.push_back({layout_inst, field_name, filter_node.op, filter_node.value, filter_index});
     }
 
     return ctx;

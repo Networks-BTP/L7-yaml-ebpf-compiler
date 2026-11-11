@@ -109,9 +109,13 @@ inline std::string length_source_expr(const DSLAnalyzer::ResolvedContext& ctx,
 // Every step proves to the eBPF verifier that it stays inside the packet before touching it.
 // Values are stored in the record in host byte order; variable-length fields are stored as
 // <name>_off (relative to the start of the application payload) and <name>_len.
+// `lval` is the C lvalue of the record being filled; it defaults to the instance name, and is
+// "answers[2]" for one element of a repeated instance.
 inline std::string emit_dynamic_parse(const DSLAnalyzer::ResolvedContext& ctx,
-                                      const DSLAnalyzer::ResolvedLayoutInstance& instance) {
-    const std::string& inst = instance.instance_name;
+                                      const DSLAnalyzer::ResolvedLayoutInstance& instance,
+                                      const std::string& lval = std::string()) {
+    const std::string lv = lval.empty() ? instance.instance_name : lval;
+    const std::string& inst = lv;
     const DSLAnalyzer::ResolvedType& t = ctx.types.at(instance.type_ref);
     require_supported_fields(t);
 
@@ -261,6 +265,63 @@ inline std::string emit_dynamic_parse(const DSLAnalyzer::ResolvedContext& ctx,
     return code;
 }
 
+// Indents every non-empty line of generated code by four spaces.
+inline std::string indent4(const std::string& code) {
+    std::ostringstream o;
+    std::istringstream in(code);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) o << "\n";
+        else o << "    " << line << "\n";
+    }
+    return o.str();
+}
+
+// Emits the C that parses a repeated instance.  The repetition is unrolled *here*, in the generator,
+// so every record index in the generated C is a compile-time constant (the verifier dislikes
+// variable-indexed stack access) and each element reuses the single-instance parser unchanged.
+//   <name>[k]  the k-th record, host byte order;  <name>_n  how many elements were parsed.
+// A count above the cap rejects the message.  A count of 0 parses nothing and leaves the cursor alone.
+// With `inplace` the records live in the telemetry event (`ev.<name>[k]`, `ev.<name>_n`) instead of in
+// local arrays: the event and a second copy of the records would not both fit on the 512-byte BPF stack.
+inline std::string emit_repeated_parse(const DSLAnalyzer::ResolvedContext& ctx,
+                                       const DSLAnalyzer::ResolvedLayoutInstance& instance,
+                                       bool inplace = false) {
+    const DSLAnalyzer::RepeatSpec& rs = *instance.repeat;
+    const std::string& inst = instance.instance_name;
+    const std::string base = (inplace ? "ev." : "") + inst;   // C name of the record array
+    const std::string counter = base + "_n";
+    auto element = [&](uint32_t k) {
+        return emit_dynamic_parse(ctx, instance, base + "[" + std::to_string(k) + "]") + "\n";
+    };
+
+    std::ostringstream o;
+    if (rs.is_constant) {
+        o << "    // " << inst << ": repeated " << rs.constant << " time(s)\n";
+        for (uint32_t k = 0; k < rs.constant; ++k) {
+            o << "    {\n" << indent4(element(k));
+            o << "        " << counter << " = " << (k + 1) << ";\n";
+            o << "    }\n";
+        }
+    } else {
+        o << "    // " << inst << ": repeated, count = " << rs.src_instance << "." << rs.src_field
+          << ", at most " << rs.max << " time(s)\n";
+        o << "    {\n";
+        o << "        __u64 dsl_want = (__u64)" << length_source_expr(ctx, rs.src_instance, rs.src_field) << ";\n";
+        o << "        if (dsl_want > " << rs.max << ") return XDP_PASS;\n";
+        for (uint32_t k = 0; k < rs.max; ++k) {
+            o << "        if (dsl_want > " << k << ") {\n" << indent4(indent4(element(k)));
+            o << "            " << counter << " = " << (k + 1) << ";\n";
+            o << "        }\n";
+        }
+        o << "    }\n";
+    }
+
+    std::string code = o.str();
+    if (!code.empty() && code.back() == '\n') code.pop_back(); // the template adds the newline
+    return code;
+}
+
 // 1. Context to JSON Mapper
 inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool telemetry = false) {
     json data;
@@ -268,6 +329,11 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool
     std::string upper = ctx.protocol_name;
     std::transform(upper.begin(), upper.end(), upper.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+    // Telemetry + a repeated instance: parse the repeated records straight into the event (see emit_repeated_parse).
+    const bool inplace = telemetry && std::any_of(ctx.layout.begin(), ctx.layout.end(),
+        [](const DSLAnalyzer::ResolvedLayoutInstance& i) { return i.repeat.has_value(); });
+    data["inplace_event"] = inplace;
 
     data["protocol"] = ctx.protocol_name;
     data["protocol_upper"] = upper;
@@ -314,7 +380,11 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool
         l_json["type_ref"] = l_inst.type_ref;
         l_json["c_struct"] = c_struct_name(r_type);
         l_json["is_dynamic"] = r_type.is_dynamic;
-        std::string parse_code = r_type.is_dynamic ? emit_dynamic_parse(ctx, l_inst) : "";
+        l_json["is_repeated"] = l_inst.repeat.has_value();
+        l_json["max_repeat"] = l_inst.repeat ? l_inst.repeat->max : 0;
+        std::string parse_code;
+        if (l_inst.repeat) parse_code = emit_repeated_parse(ctx, l_inst, inplace);
+        else if (r_type.is_dynamic) parse_code = emit_dynamic_parse(ctx, l_inst);
         if (telemetry) {
             // Every early exit of the message parser becomes a counted rejection.
             const std::string from = "return XDP_PASS;", to = "DSL_REJECT;";
@@ -367,7 +437,12 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool
         // Static types are overlaid on the packet (big-endian, needs a byte swap);
         // dynamic records already hold host-order values.
         std::string lhs;
-        if (r_type.is_dynamic) {
+        std::string guard; // repeated instance: the element only exists when it was actually parsed
+        if (f.index) {
+            const std::string base = (inplace ? "ev." : "") + f.layout_instance;
+            lhs = base + "[" + std::to_string(*f.index) + "]." + f.field_name;
+            guard = base + "_n > " + std::to_string(*f.index);
+        } else if (r_type.is_dynamic) {
             lhs = f.layout_instance + "." + f.field_name;
         } else {
             std::string access = f.layout_instance + "->" + f.field_name;
@@ -390,6 +465,7 @@ inline json build_template_context(const DSLAnalyzer::ResolvedContext& ctx, bool
 
         json fj;
         fj["lhs"] = lhs;
+        fj["guard"] = guard;
         fj["op"] = filter_op_to_c(f.op);
         fj["value"] = std::to_string(numeric) + "ULL";
         data["filters"].push_back(fj);
@@ -438,7 +514,12 @@ struct {{ protocol }}_event {
     __u16 dsl_src_port;   // transport ports, host byte order
     __u16 dsl_dst_port;
 ## for item in layout
+## if item.is_repeated
+    struct {{ item.c_struct }} {{ item.instance_name }}[{{ item.max_repeat }}];
+    __u8 {{ item.instance_name }}_n;
+## else
     struct {{ item.c_struct }} {{ item.instance_name }};
+## endif
 ## endfor
 };
 
@@ -476,6 +557,19 @@ static inline void dsl_put_hex(const unsigned char *b, __u32 len) {
 // Prints every parsed field of one event as  instance.field=value  (text fields quoted).
 static inline void dsl_print_event(const DSL_EVENT_T *ev, const unsigned char *pkt) {
 ## for item in layout
+## if item.is_repeated
+    for (unsigned k = 0; k < ev->{{ item.instance_name }}_n; k++) {
+## for f in item.fields
+## if f.kind == "view"
+        printf(" {{ item.instance_name }}[%u].{{ f.name }}=", k); dsl_put_bytes(pkt, ev->dsl_snap_len, ev->dsl_app_off + ev->{{ item.instance_name }}[k].{{ f.name }}_off, ev->{{ item.instance_name }}[k].{{ f.name }}_len);
+## else if f.kind == "scalar"
+        printf(" {{ item.instance_name }}[%u].{{ f.name }}=%llu", k, (unsigned long long){% if f.swap != "" %}{{ f.swap }}{% endif %}(ev->{{ item.instance_name }}[k].{{ f.name }}));
+## else
+        printf(" {{ item.instance_name }}[%u].{{ f.name }}=", k); dsl_put_hex((const unsigned char *)ev->{{ item.instance_name }}[k].{{ f.name }}, {{ f.size }});
+## endif
+## endfor
+    }
+## else
 ## for f in item.fields
 ## if f.kind == "view"
     printf(" {{ item.instance_name }}.{{ f.name }}="); dsl_put_bytes(pkt, ev->dsl_snap_len, ev->dsl_app_off + ev->{{ item.instance_name }}.{{ f.name }}_off, ev->{{ item.instance_name }}.{{ f.name }}_len);
@@ -485,6 +579,7 @@ static inline void dsl_print_event(const DSL_EVENT_T *ev, const unsigned char *p
     printf(" {{ item.instance_name }}.{{ f.name }}="); dsl_put_hex((const unsigned char *)ev->{{ item.instance_name }}.{{ f.name }}, {{ f.size }});
 ## endif
 ## endfor
+## endif
 ## endfor
 }
 #endif // DSL_USERSPACE
@@ -568,11 +663,23 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 
     // 3. Application Protocol Layout Parsing
     void *cursor = app_payload;
+## if inplace_event
+
+    // Repeated instances are parsed straight into the event: a second copy would not fit on the BPF stack.
+    DSL_EVENT_T ev = {};
+## endif
 
 ## for item in layout
     // Parse Layout Instance: {{ item.instance_name }} (Type: {{ item.type_ref }})
 ## if item.is_dynamic
+## if item.is_repeated
+## if not inplace_event
+    struct {{ item.c_struct }} {{ item.instance_name }}[{{ item.max_repeat }}] = {};
+    __u8 {{ item.instance_name }}_n = 0;
+## endif
+## else
     struct {{ item.c_struct }} {{ item.instance_name }} = {};
+## endif
 {{ item.parse_code }}
 ## else
     struct {{ item.c_struct }} *{{ item.instance_name }} = cursor;
@@ -584,13 +691,15 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 
     // 4. Observability Filters
 ## for f in filters
-    if (!({{ f.lhs }} {{ f.op }} {{ f.value }})) {% if telemetry %}{ dsl_count(DSL_STAT_FILTERED); return XDP_PASS; }{% else %}return XDP_PASS;{% endif %}
+    if (!({% if f.guard != "" %}{{ f.guard }} && {% endif %}{{ f.lhs }} {{ f.op }} {{ f.value }})) {% if telemetry %}{ dsl_count(DSL_STAT_FILTERED); return XDP_PASS; }{% else %}return XDP_PASS;{% endif %}
 ## endfor
 
     // Payload successfully parsed and matched!
 ## if telemetry
     {
+## if not inplace_event
         DSL_EVENT_T ev = {};
+## endif
         __u32 pkt_len = (__u32)((__u8 *)data_end - (__u8 *)data);
         __u32 snap = pkt_len < DSL_SNAP_LEN ? pkt_len : DSL_SNAP_LEN;
         ev.dsl_pkt_len = pkt_len;
@@ -601,7 +710,12 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
         ev.dsl_src_port = bpf_ntohs(l4->source);
         ev.dsl_dst_port = bpf_ntohs(l4->dest);
 ## for item in layout
-## if item.is_dynamic
+## if item.is_repeated
+## if not inplace_event
+        __builtin_memcpy(ev.{{ item.instance_name }}, {{ item.instance_name }}, sizeof(ev.{{ item.instance_name }}));
+        ev.{{ item.instance_name }}_n = {{ item.instance_name }}_n;
+## endif
+## else if item.is_dynamic
         ev.{{ item.instance_name }} = {{ item.instance_name }};
 ## else
         ev.{{ item.instance_name }} = *{{ item.instance_name }};

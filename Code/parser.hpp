@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <optional>
+#include <set>
 #include <type_traits>
 
 namespace DSLParser {
@@ -56,6 +57,33 @@ inline std::optional<T> get_optional_field(const YAML::Node& node, const std::st
         }
     }
     return std::nullopt;
+}
+
+// Rejects keys the parser does not know, so a typo or an unsupported feature can never be
+// silently ignored (e.g. `repeat:` on a compiler that has no repeat).
+inline void reject_unknown_keys(const YAML::Node& node, const std::set<std::string>& allowed,
+                                const std::string& context) {
+    for (YAML::const_iterator it = node.begin(); it != node.end(); ++it) {
+        std::string key = it->first.as<std::string>();
+        if (!allowed.count(key)) {
+            std::string list;
+            for (const auto& a : allowed) list += (list.empty() ? "" : ", ") + a;
+            throw std::runtime_error("Parsing Error [" + context + "]: Unknown key '" + key +
+                                     "' (allowed: " + list + ")");
+        }
+    }
+}
+
+// Reads the attributes shared by both layout notations (map form and sequence form).
+// `item` must be a map that already has its type resolved by the caller.
+inline void parse_layout_attrs(const YAML::Node& item, LayoutNode& lnode, const std::string& context) {
+    reject_unknown_keys(item, {"name", "type", "offset", "repeat", "max_repeat"}, context);
+    lnode.offset_expr = get_optional_field<std::string>(item, "offset");
+    lnode.repeat_expr = get_optional_field<std::string>(item, "repeat");
+    lnode.max_repeat  = get_optional_field<uint32_t>(item, "max_repeat");
+    if (lnode.max_repeat && !lnode.repeat_expr) {
+        throw std::runtime_error("Parsing Error [" + context + "]: 'max_repeat' given without 'repeat'");
+    }
 }
 
 // Enum Conversions
@@ -135,6 +163,9 @@ inline FieldNode parse_field(const std::string& field_name, const YAML::Node& no
     if (!node.IsMap()) {
         throw std::runtime_error("Parsing Error [" + context + "]: Field definition must be a YAML map");
     }
+
+    reject_unknown_keys(node, {"name", "type", "offset", "data_type", "size", "length_field", "max_bytes",
+                               "multiplier", "addend", "marker", "trim_whitespace"}, context);
 
     std::string prim_type = to_lower(get_required_field<std::string>(node, "type", context));
     std::optional<std::string> offset_expr = get_optional_field<std::string>(node, "offset");
@@ -258,7 +289,7 @@ inline ProtocolAST parse_yaml(const std::string& yaml_content) {
 
                 if (lval.IsMap()) {
                     lnode.type_ref = get_required_field<std::string>(lval, "type", context);
-                    lnode.offset_expr = get_optional_field<std::string>(lval, "offset");
+                    parse_layout_attrs(lval, lnode, context);
                 } else if (lval.IsScalar()) {
                     lnode.type_ref = get_required_field<std::string>(layout_node, lnode.instance_name, context);
                 }
@@ -270,7 +301,7 @@ inline ProtocolAST parse_yaml(const std::string& yaml_content) {
                 std::string context = "Layout Sequence Item";
                 lnode.instance_name = get_required_field<std::string>(item, "name", context);
                 lnode.type_ref = get_required_field<std::string>(item, "type", context + " '" + lnode.instance_name + "'");
-                lnode.offset_expr = get_optional_field<std::string>(item, "offset");
+                parse_layout_attrs(item, lnode, context + " '" + lnode.instance_name + "'");
                 ast.layout.push_back(lnode);
             }
         } else {
