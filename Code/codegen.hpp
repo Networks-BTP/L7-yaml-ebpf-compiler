@@ -584,7 +584,7 @@ int xdp_{{ protocol }}_parser(struct xdp_md *ctx) {
 
     // 4. Observability Filters
 ## for f in filters
-    if (!({{ f.lhs }} {{ f.op }} {{ f.value }})) {% if telemetry %}{ dsl_count(DSL_STAT_FILTERED); return XDP_PASS; }{% else %}return XDP_PASS;{% endif %}
+    if (!({{ f.lhs }} {{ f.op }} {{ f.value }})) {% if telemetry %}{ dsl_count(DSL_STAT_FILTERED); return XDP_DROP; }{% else %}return XDP_DROP;{% endif %}
 ## endfor
 
     // Payload successfully parsed and matched!

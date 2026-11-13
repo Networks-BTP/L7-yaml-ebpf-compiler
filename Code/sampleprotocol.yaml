@@ -1,0 +1,22 @@
+protocol: sampleprotocol
+transport: udp
+port: 9999
+
+types:
+  Header:
+    fields:
+      len:   { type: fixed, size: 2 }
+      flag:  { type: fixed, size: 1 }
+      body:  { type: length_prefixed }
+
+layout:
+  - name: hdr
+    type: Header
+
+lp_resolutions:
+  - { field_name: body, length_name: len, max_bytes: 1024 }
+
+filters:
+  - field: hdr.flag
+    op: "=="
+    value: "1"

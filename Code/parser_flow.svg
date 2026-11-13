@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="12in" height="1.65in" viewBox="0 0 716 165" role="img" aria-labelledby="title description">
+  <title id="title">IEEE double-column YAML-to-eBPF pipeline</title>
+  <desc id="description">A straight, IEEE double-column-width pipeline: protocol YAML is parsed into an AST, analyzed into a resolved model, and code-generated as common.h and tracer.bpf.c. Clang compiles the BPF object, which is attached to XDP for kernel packet filtering and telemetry.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#79513b"/>
+    </marker>
+    <style>
+      .stage { fill: #f5e9dd; stroke: #38332f; stroke-width: 1.15; }
+      .analyze { fill: #f4efe4; stroke: #38332f; stroke-width: 1.15; }
+      .codegen { fill: #edf0e7; stroke: #38332f; stroke-width: 1.15; }
+      .runtime { fill: #f0eee7; stroke: #38332f; stroke-width: 1.15; }
+      .paper { fill: #fffdfa; stroke: #79513b; stroke-width: 1.15; }
+      .fold { fill: #f0e5d9; stroke: #79513b; stroke-width: 1; }
+      .link { fill: none; stroke: #79513b; stroke-width: 1.2; marker-end: url(#arrow); }
+      .heading { font: 600 10.5px Arial, Helvetica, sans-serif; fill: #282522; text-anchor: middle; }
+      .detail { font: 8.2px Arial, Helvetica, sans-serif; fill: #514840; text-anchor: middle; }
+      .file { font: 7.2px Arial, Helvetica, sans-serif; fill: #38332f; text-anchor: middle; }
+      .compact-heading { font-size: 9px; }
+      .icon { fill: none; stroke: #9a6748; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="716" height="165" fill="#fffdfa"/>
+
+  <path class="paper" d="M8 52 H34 L42 60 V128 H8 Z"/>
+  <path class="fold" d="M34 52 V60 H42"/>
+  <text class="heading" x="25" y="89">YAML</text>
+  <text class="detail" x="25" y="103">protocol</text>
+
+  <path class="link" d="M43 90 H50"/>
+  <rect class="stage" x="51" y="52" width="57" height="76" rx="6"/>
+  <path class="icon" d="M73 63 H69 V71 H73 M86 63 H90 V71 H86 M84 62 L77 72"/>
+  <text class="heading" x="79.5" y="90">Parse</text>
+  <text class="detail" x="79.5" y="105">types • fields</text>
+
+  <path class="link" d="M108 90 H114"/>
+  <path class="paper" d="M115 56 H143 L159 72 V124 H115 Z"/>
+  <path class="fold" d="M143 56 V72 H159"/>
+  <text class="heading" x="137" y="96">AST</text>
+
+  <path class="link" d="M159 90 H165"/>
+  <rect class="analyze" x="166" y="52" width="70" height="76" rx="6"/>
+  <circle class="icon" cx="201" cy="65" r="4"/>
+  <path class="icon" d="M204 68 L208 72"/>
+  <text class="heading" x="201" y="89">Analyze</text>
+  <text class="detail" x="201" y="102">bind • validate</text>
+  <text class="detail" x="201" y="114">infer size + offset</text>
+
+  <path class="link" d="M236 90 H242"/>
+  <path class="paper" d="M243 56 H279 L295 72 V124 H243 Z"/>
+  <path class="fold" d="M279 56 V72 H295"/>
+  <text class="heading compact-heading" x="269" y="86">Resolved</text>
+  <text class="heading" x="269" y="98">model</text>
+  <text class="detail" x="269" y="110">symbols</text>
+  <text class="detail" x="269" y="120">bounds</text>
+
+  <path class="link" d="M295 90 H301"/>
+  <rect class="codegen" x="302" y="52" width="58" height="76" rx="6"/>
+  <path class="icon" d="M322 63 L318 68 L322 73 M340 63 L344 68 L340 73 M338 62 L330 74"/>
+  <text class="heading" x="331" y="90">Codegen</text>
+  <text class="detail" x="331" y="105">C / eBPF</text>
+
+  <path class="link" d="M360 90 H366"/>
+  <text class="detail" x="415" y="45">GENERATED FILES</text>
+  <path class="paper" d="M367 52 H405 L412 59 V128 H367 Z"/>
+  <path class="fold" d="M405 52 V59 H412"/>
+  <path class="paper" d="M416 52 H455 L463 60 V128 H416 Z"/>
+  <path class="fold" d="M455 52 V60 H463"/>
+  <text class="file" x="389.5" y="96">common.h</text>
+  <text class="file" x="435.5" y="96">tracer.bpf.c</text>
+
+  <path class="link" d="M463 90 H469"/>
+  <rect class="codegen" x="470" y="52" width="46" height="76" rx="6"/>
+  <path class="icon" d="M484 63 H502 M487 67 H499 M490 71 H496"/>
+  <text class="heading" x="493" y="92">Clang</text>
+  <text class="detail" x="493" y="106">compile</text>
+
+  <path class="link" d="M516 90 H522"/>
+  <path class="paper" d="M523 52 H562 L570 60 V128 H523 Z"/>
+  <path class="fold" d="M562 52 V60 H570"/>
+  <text class="file" x="546.5" y="96">tracer.bpf.o</text>
+
+  <path class="link" d="M570 90 H576"/>
+  <rect class="runtime" x="577" y="52" width="56" height="76" rx="6"/>
+  <path class="icon" d="M597 63 V73 M592 68 H602 M594 65 L600 71 M600 65 L594 71"/>
+  <text class="heading" x="605" y="90">XDP</text>
+  <text class="detail" x="605" y="103">attach</text>
+  <text class="detail" x="605" y="115">to kernel</text>
+
+  <path class="link" d="M633 90 H639"/>
+  <rect class="runtime" x="640" y="52" width="68" height="76" rx="6"/>
+  <path class="icon" d="M663 63 H679 V73 H663 Z M667 60 V63 M671 60 V63 M675 60 V63 M667 73 V76 M671 73 V76 M675 73 V76"/>
+  <text class="heading" x="674" y="92">Kernel XDP</text>
+  <text class="detail" x="674" y="106">filtering</text>
+  <text class="detail" x="674" y="118">telemetry</text>
+</svg>
